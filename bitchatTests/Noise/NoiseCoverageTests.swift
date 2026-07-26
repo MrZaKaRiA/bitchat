@@ -12,8 +12,15 @@ struct NoiseCoverageTests {
     private let bobStaticKey = Curve25519.KeyAgreement.PrivateKey()
     private let charlieStaticKey = Curve25519.KeyAgreement.PrivateKey()
 
-    private let alicePeerID = PeerID(str: "0011223344556677")
-    private let bobPeerID = PeerID(str: "8899aabbccddeeff")
+    // Manager test dictionaries are keyed by the remote peer. Keep the
+    // historical names, but derive each wire ID from the static key that the
+    // corresponding manager authenticates during the handshake.
+    private var alicePeerID: PeerID {
+        PeerID(publicKey: bobStaticKey.publicKey.rawRepresentation)
+    }
+    private var bobPeerID: PeerID {
+        PeerID(publicKey: aliceStaticKey.publicKey.rawRepresentation)
+    }
     private let charliePeerID = PeerID(str: "fedcba9876543210")
 
     @Test("Protocol metadata and handshake patterns expose expected values")
@@ -172,7 +179,7 @@ struct NoiseCoverageTests {
             Data(),
             Data(repeating: 0x00, count: 32),
             Data([0x01] + Array(repeating: 0x00, count: 31)),
-            Data(repeating: 0xFF, count: 32),
+            Data(repeating: 0xFF, count: 32)
         ]
 
         for invalidKey in invalidKeys {

@@ -84,11 +84,30 @@ import SwiftUI
 import Combine
 import CommonCrypto
 import CoreBluetooth
-import Tor
 #if os(iOS)
 import UIKit
 #endif
 import UniformTypeIdentifiers
+
+struct PanicNetworkLifecycle {
+    let stop: @MainActor () -> Void
+    let restart: @MainActor () -> Void
+
+    static let noop = PanicNetworkLifecycle(stop: {}, restart: {})
+
+    static var live: PanicNetworkLifecycle {
+        PanicNetworkLifecycle(
+            stop: {
+                GeohashPresenceService.shared.stopForPanic()
+                NetworkActivationService.shared.stopForPanic()
+            },
+            restart: {
+                NetworkActivationService.shared.start()
+                GeohashPresenceService.shared.start()
+            }
+        )
+    }
+}
 
 /// Manages the application state and business logic for BitChat.
 /// Acts as the primary coordinator between UI components and backend services,
@@ -102,7 +121,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
     @MainActor
     var canSendMediaInCurrentContext: Bool {
         if let peer = selectedPrivateChatPeer {
-            return !(peer.isGeoDM || peer.isGeoChat)
+            // Media transfer is not wired for groups in v1 (sendFilePrivate
+            // rejects the virtual group_ recipient), so keep the affordance off.
+            return !(peer.isGeoDM || peer.isGeoChat || peer.isGroup)
         }
         switch activeChannel {
         case .mesh: return true
@@ -141,6 +162,8 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
     @Published var currentColorScheme: ColorScheme = .light
     @Published var currentTheme: AppTheme = .matrix
     @Published var isConnected = false
+    @Published private(set) var panicRecoveryBlocked = false
+    var networkActivationAllowed: Bool { !panicRecoveryBlocked }
     @Published var nickname: String = "" {
         didSet {
             // Trim whitespace whenever nickname is set; whitespace-only becomes ""
@@ -150,7 +173,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
                 return
             }
             // Update mesh service nickname if it's initialized
-            if !meshService.myPeerID.isEmpty {
+            if !isPanicResetting, !meshService.myPeerID.isEmpty {
                 meshService.setNickname(nickname)
             }
         }
@@ -176,12 +199,21 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
     lazy var privateConversationCoordinator = ChatPrivateConversationCoordinator(context: self)
     lazy var nostrCoordinator = ChatNostrCoordinator(context: self)
     lazy var mediaTransferCoordinator = ChatMediaTransferCoordinator(context: self)
+    lazy var liveVoiceCoordinator = ChatLiveVoiceCoordinator(
+        context: self,
+        sweepsOnInit: !TestEnvironment.isRunningTests
+    )
     lazy var verificationCoordinator = ChatVerificationCoordinator(context: self)
+    lazy var groupCoordinator = ChatGroupCoordinator(context: self)
+    lazy var vouchCoordinator = ChatVouchCoordinator(context: self)
 
     // Computed properties for compatibility
     @MainActor
     var connectedPeers: Set<PeerID> { unifiedPeerService.connectedPeerIDs }
     @Published var allPeers: [BitchatPeer] = []
+    /// Nickname of whoever is talking live in the public mesh channel right
+    /// now (floor-courtesy indicator on the composer mic), nil when nobody.
+    @Published var activePublicVoiceTalker: String?
 
     /// Read-only derived view of all direct conversations in the
     /// `ConversationStore`, keyed by routing peer ID. Serves the coordinator
@@ -214,12 +246,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         conversations.unreadDirectRoutingPeerIDs()
     }
 
-    /// Check if there are any unread messages (including from temporary Nostr peer IDs)
-    @MainActor
-    var hasAnyUnreadMessages: Bool {
-        !unreadPrivateMessages.isEmpty
-    }
-
     /// Open the most relevant private chat when tapping the toolbar unread icon.
     /// Prefers the most recently active unread conversation, otherwise the most recent PM.
     @MainActor
@@ -235,20 +261,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
     var selectedPrivateChatFingerprint: String? {
         get { peerIdentityStore.selectedPrivateChatFingerprint }
         set { peerIdentityStore.setSelectedPrivateChatFingerprint(newValue) }
-    }
-
-    // Resolve full Noise key for a peer's short ID (used by UI header rendering)
-    @MainActor
-    private func getNoiseKeyForShortID(_ shortPeerID: PeerID) -> PeerID? {
-        if let mapped = peerIdentityStore.stablePeerID(forShortID: shortPeerID) { return mapped }
-        // Fallback: derive from active Noise session if available
-        if shortPeerID.id.count == 16,
-           let key = meshService.noiseSessionPublicKeyData(for: shortPeerID) {
-            let stable = PeerID(hexData: key)
-            peerIdentityStore.setStablePeerID(stable, forShortID: shortPeerID)
-            return stable
-        }
-        return nil
     }
 
     // Resolve short mesh ID (16-hex) from a full Noise public key hex (64-hex)
@@ -305,12 +317,20 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
     var nostrRelayManager: NostrRelayManager?
     private let userDefaults = UserDefaults.standard
     let keychain: KeychainManagerProtocol
+    private let panicRecoveryOperations: PanicRecoveryOperations
+    private let panicNetworkLifecycle: PanicNetworkLifecycle
+    private var isPanicResetting = false
+    /// Private group membership: keys in the keychain, metadata on disk.
+    let groupStore: GroupStore
     private let nicknameKey = "bitchat.nickname"
     // Location channel state (macOS supports manual geohash selection)
     var activeChannel: ChannelID {
         get { conversations.activeChannel }
         set {
             guard conversations.activeChannel != newValue else { return }
+            // Leaving a channel expedites any in-flight NIP-13 mining: the
+            // pending message still sends, at the difficulty already reached.
+            outgoingCoordinator.expeditePendingGeohashMining()
             conversations.setActiveChannel(newValue)
             visibleMessagesCache = nil
             objectWillChange.send()
@@ -342,17 +362,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
     // MARK: - Social Features (Delegated to PeerStateManager)
 
     @MainActor
-    var favoritePeers: Set<String> { unifiedPeerService.favoritePeers }
-    @MainActor
     var blockedUsers: Set<String> { unifiedPeerService.blockedUsers }
 
     // MARK: - Encryption and Security
 
-    // Noise Protocol encryption status
-    var peerEncryptionStatus: [PeerID: EncryptionStatus] {
-        get { peerIdentityStore.encryptionStatuses }
-        set { peerIdentityStore.replaceEncryptionStatuses(newValue) }
-    }
     var verifiedFingerprints: Set<String> {
         get { peerIdentityStore.verifiedFingerprints }
         set { peerIdentityStore.setVerifiedFingerprints(newValue) }
@@ -413,16 +426,18 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
     let readReceiptsDefaults: UserDefaults
 
     /// Default read-receipt persistence store. Production uses `.standard`.
-    /// Under test, a dedicated scratch suite is used instead — wiped at first
-    /// use per process — so back-to-back local test runs never see each
-    /// other's persisted receipts (and tests never pollute `.standard`).
-    static let defaultReadReceiptsDefaults: UserDefaults = {
+    /// Under test, every instance gets its own scratch suite: a per-process
+    /// shared suite let one test's persisted receipts leak into another
+    /// test's freshly constructed view model (surfaced as an order-dependent
+    /// CI flake on a duplicated message ID), and tests never pollute
+    /// `.standard`.
+    static func defaultReadReceiptsDefaults() -> UserDefaults {
         guard TestEnvironment.isRunningTests else { return .standard }
-        let suiteName = "chat.bitchat.tests.readReceipts"
+        let suiteName = "chat.bitchat.tests.readReceipts.\(UUID().uuidString)"
         guard let scratch = UserDefaults(suiteName: suiteName) else { return .standard }
         scratch.removePersistentDomain(forName: suiteName)
         return scratch
-    }()
+    }
 
     // Track sent read receipts to avoid duplicates (persisted across launches)
     // Note: Persistence happens automatically in didSet, no lifecycle observers needed
@@ -711,12 +726,30 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         conversations.conversationsByID[conversationID]?.containsMessage(withID: messageID) ?? false
     }
 
+    @MainActor
+    func bridgeInjectedPublicMessageIsPresent(withID messageID: String) -> Bool {
+        publicMessagePipeline.containsMessage(withID: messageID) ||
+            publicConversationContainsMessage(withID: messageID, in: .mesh)
+    }
+
     /// Removes a message by ID from whichever public conversation contains
     /// it. Returns the removed message, if any.
     @MainActor
     @discardableResult
     func removePublicMessage(withID messageID: String) -> BitchatMessage? {
-        conversations.removePublicMessage(withID: messageID)
+        publicMessagePipeline.removeMessage(withID: messageID)
+        return conversations.removePublicMessage(withID: messageID)
+    }
+
+    /// Replaces an unauthenticated bridge alias with a later authenticated
+    /// radio row. In addition to both storage layers, clear the content-window
+    /// marker written by an already-flushed alias or it would suppress the
+    /// genuine row during the next public-message batch.
+    @MainActor
+    func removeBridgeInjectedPublicMessage(withID messageID: String) {
+        publicMessagePipeline.removeMessage(withID: messageID)
+        guard let removed = conversations.removePublicMessage(withID: messageID) else { return }
+        deduplicationService.forgetContent(removed.content, ifRecordedAt: removed.timestamp)
     }
 
     /// Removes every message matching `predicate` from a geohash
@@ -764,15 +797,48 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         locationPresenceStore: LocationPresenceStore? = nil,
         locationManager: LocationChannelManager = .shared
     ) {
+        let livePanicRecoveryOperations = PanicRecoveryOperations.live()
+        let startSuspendedForRecovery: Bool
+        do {
+            startSuspendedForRecovery =
+                try livePanicRecoveryOperations.isPending()
+        } catch {
+            startSuspendedForRecovery = true
+        }
+        // Preserve the preflight decision used to defer CoreBluetooth. A
+        // transiently successful second read must not skip recovery and leave
+        // the service permanently suspended without running the wipe.
+        let panicRecoveryOperations = PanicRecoveryOperations(
+            isPending: {
+                if startSuspendedForRecovery {
+                    return true
+                }
+                return try livePanicRecoveryOperations.isPending()
+            },
+            begin: livePanicRecoveryOperations.begin,
+            wipeMedia: livePanicRecoveryOperations.wipeMedia,
+            complete: livePanicRecoveryOperations.complete
+        )
+        let meshService = BLEService(
+            keychain: keychain,
+            idBridge: idBridge,
+            identityManager: identityManager,
+            startSuspendedForPanicRecovery: startSuspendedForRecovery
+        )
+        meshService.sfMetrics = .shared
         self.init(
             keychain: keychain,
             idBridge: idBridge,
             identityManager: identityManager,
-            transport: BLEService(keychain: keychain, idBridge: idBridge, identityManager: identityManager),
+            transport: meshService,
             conversations: conversations,
             peerIdentityStore: peerIdentityStore ?? PeerIdentityStore(),
             locationPresenceStore: locationPresenceStore ?? LocationPresenceStore(),
-            locationManager: locationManager
+            locationManager: locationManager,
+            outboxStore: MessageOutboxStore(keychain: keychain),
+            sfMetrics: .shared,
+            panicRecoveryOperations: panicRecoveryOperations,
+            panicNetworkLifecycle: .live
         )
     }
 
@@ -788,7 +854,12 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         peerIdentityStore: PeerIdentityStore? = nil,
         locationPresenceStore: LocationPresenceStore? = nil,
         locationManager: LocationChannelManager = .shared,
-        readReceiptsDefaults: UserDefaults? = nil
+        readReceiptsDefaults: UserDefaults? = nil,
+        outboxStore: MessageOutboxStore? = nil,
+        sfMetrics: StoreAndForwardMetrics? = nil,
+        panicMediaWipe: (() throws -> Void)? = nil,
+        panicRecoveryOperations: PanicRecoveryOperations? = nil,
+        panicNetworkLifecycle: PanicNetworkLifecycle = .noop
     ) {
         let conversations = conversations ?? ConversationStore()
         let peerIdentityStore = peerIdentityStore ?? PeerIdentityStore()
@@ -797,10 +868,16 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
             keychain: keychain,
             idBridge: idBridge,
             identityManager: identityManager,
-            meshService: transport
+            meshService: transport,
+            outboxStore: outboxStore,
+            sfMetrics: sfMetrics
         )
 
         self.keychain = keychain
+        self.panicRecoveryOperations = panicRecoveryOperations
+            ?? .ephemeral(wipeMedia: panicMediaWipe ?? {})
+        self.panicNetworkLifecycle = panicNetworkLifecycle
+        self.groupStore = GroupStore(keychain: keychain)
         self.idBridge = idBridge
         self.identityManager = identityManager
         self.conversations = conversations
@@ -815,7 +892,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         self.autocompleteService = services.autocompleteService
         self.deduplicationService = services.deduplicationService
         self.publicMessagePipeline = services.publicMessagePipeline
-        let readReceiptsDefaults = readReceiptsDefaults ?? Self.defaultReadReceiptsDefaults
+        let readReceiptsDefaults = readReceiptsDefaults ?? Self.defaultReadReceiptsDefaults()
         self.readReceiptsDefaults = readReceiptsDefaults
         self.sentReadReceipts = ChatViewModelBootstrapper.loadPersistedReadReceipts(userDefaults: readReceiptsDefaults)
 
@@ -835,7 +912,31 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
             }
             .store(in: &cancellables)
 
-        ChatViewModelBootstrapper(viewModel: self).configure()
+        let recoveryRequired: Bool
+        do {
+            recoveryRequired = try self.panicRecoveryOperations.isPending()
+        } catch {
+            // Failure to read the latch cannot fail open. Re-run the complete
+            // transaction; a persistent storage failure leaves services
+            // blocked below.
+            recoveryRequired = true
+            SecureLogger.error(
+                "Could not read panic-recovery state; retrying the full wipe before startup: \(error)",
+                category: .security
+            )
+        }
+
+        if recoveryRequired {
+            SecureLogger.warning(
+                "Pending panic recovery detected; wiping before runtime services start",
+                category: .security
+            )
+            _ = panicClearAllData(restartServices: false)
+        }
+
+        if networkActivationAllowed {
+            ChatViewModelBootstrapper(viewModel: self).configure()
+        }
     }
 
     // MARK: - Deinitialization
@@ -910,6 +1011,12 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         outgoingCoordinator.sendMessage(content)
     }
 
+    /// Sends a 👋 to the mesh channel regardless of the active channel.
+    @MainActor
+    func sendMeshWave() {
+        outgoingCoordinator.sendMeshWave()
+    }
+
     // MARK: - Geohash Participants
 
     @MainActor
@@ -936,11 +1043,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
     }
 
     // MARK: - Public helpers
-
-    /// Published geohash people list for SwiftUI observation
-    var geohashPeople: [GeoPerson] {
-        participantTracker.visiblePeople
-    }
 
     /// Return the current, pruned, sorted people list for the active geohash without mutating state.
     @MainActor
@@ -988,16 +1090,50 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         )
     }
 
-    func displayNameForNostrPubkey(_ pubkeyHex: String) -> String {
-        publicConversationCoordinator.displayNameForNostrPubkey(pubkeyHex)
+    // Mesh (Noise identity) block helpers. Unlike the `/block <nickname>`
+    // command, these resolve and persist the block by the peer's stable
+    // fingerprint (derived from `peerID`), so the exact tapped peer is
+    // (un)blocked — unambiguous across nickname collisions and functional for
+    // offline peers that can no longer be resolved through the mesh service.
+    @MainActor
+    func blockMeshPeer(peerID: PeerID, displayName: String) {
+        setMeshPeerBlocked(peerID, blocked: true, displayName: displayName)
     }
 
-    // MARK: - Media Transfers
+    @MainActor
+    func unblockMeshPeer(peerID: PeerID, displayName: String) {
+        setMeshPeerBlocked(peerID, blocked: false, displayName: displayName)
+    }
 
-    private enum MediaSendError: Error {
-        case encodingFailed
-        case tooLarge
-        case copyFailed
+    @MainActor
+    private func setMeshPeerBlocked(_ peerID: PeerID, blocked: Bool, displayName: String) {
+        guard unifiedPeerService.setBlocked(peerID, blocked: blocked) != nil else {
+            addCommandOutput(
+                String(
+                    format: String(
+                        localized: blocked ? "system.mesh.block_failed" : "system.mesh.unblock_failed",
+                        comment: "System message shown when a mesh peer cannot be blocked or unblocked"
+                    ),
+                    locale: .current,
+                    displayName
+                )
+            )
+            return
+        }
+        addCommandOutput(
+            String(
+                format: String(
+                    localized: blocked ? "system.mesh.blocked" : "system.mesh.unblocked",
+                    comment: "System message shown when a mesh peer is blocked or unblocked"
+                ),
+                locale: .current,
+                displayName
+            )
+        )
+    }
+
+    func displayNameForNostrPubkey(_ pubkeyHex: String) -> String {
+        publicConversationCoordinator.displayNameForNostrPubkey(pubkeyHex)
     }
 
     func currentPublicSender() -> (name: String, peerID: PeerID) {
@@ -1061,7 +1197,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
     }
 
     @MainActor
-    @objc func handlePeerStatusUpdate(_ notification: Notification) {
+    @objc func handlePeerStatusUpdate(_: Notification) {
         peerIdentityCoordinator.handlePeerStatusUpdate()
     }
 
@@ -1095,15 +1231,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         lifecycleCoordinator.markPrivateMessagesAsRead(from: peerID)
     }
 
-    func getMessages(for peerID: PeerID?) -> [BitchatMessage] {
-        lifecycleCoordinator.getMessages(for: peerID)
-    }
-
-    @MainActor
-    func getPrivateChatMessages(for peerID: PeerID) -> [BitchatMessage] {
-        lifecycleCoordinator.getPrivateChatMessages(for: peerID)
-    }
-
     @MainActor
     func getPeerIDForNickname(_ nickname: String) -> PeerID? {
         peerIdentityCoordinator.getPeerIDForNickname(nickname)
@@ -1113,8 +1240,33 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
 
     // PANIC: Emergency data clearing for activist safety
     @MainActor
-    func panicClearAllData() {
-        // Messages are processed immediately - nothing to flush
+    @discardableResult
+    func panicClearAllData(restartServices: Bool = true) -> Bool {
+        panicRecoveryBlocked = true
+        isPanicResetting = true
+        defer { isPanicResetting = false }
+
+        // Stop internet and location-presence work before clearing identity or
+        // state. These services cancel their subscriptions and delayed tasks,
+        // so old callbacks cannot reconnect during the transaction.
+        panicNetworkLifecycle.stop()
+
+        // Establish both independent durable intents before erasing anything.
+        // `wipeMedia` will still attempt deletion if neither write succeeds.
+        let recoveryIntent = panicRecoveryOperations.begin()
+
+        // Quiesce the mesh before clearing stores. Identity replacement below
+        // deliberately stays stopped until media deletion and marker commit.
+        if let bleService = meshService as? BLEService {
+            bleService.suspendForPanicReset()
+        } else {
+            meshService.emergencyDisconnectAll()
+        }
+
+        // Invalidate detached media preparation and close live capture file
+        // handles before clearing state or removing the media directory.
+        mediaTransferCoordinator.resetForPanic()
+        liveVoiceCoordinator.resetForPanic()
 
         // Clear all messages (public timelines and private chats live in the
         // single-writer ConversationStore; the derived `messages` view and
@@ -1123,7 +1275,13 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         pendingGeohashSystemMessages.removeAll()
 
         // Delete all keychain data (including Noise and Nostr keys)
-        _ = keychain.deleteAllKeychainData()
+        let keychainWipeCompleted = keychain.deleteAllKeychainData()
+        if !keychainWipeCompleted {
+            SecureLogger.error(
+                "Panic keychain cleanup incomplete; recovery remains pending",
+                category: .security
+            )
+        }
 
         // Clear UserDefaults identity data
         userDefaults.removeObject(forKey: "bitchat.noiseIdentityKey")
@@ -1136,16 +1294,42 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
 
         // Reset nickname to anonymous
         nickname = "anon\(Int.random(in: 1000...9999))"
-        saveNickname()
+        userDefaults.set(nickname, forKey: nicknameKey)
 
         // Clear favorites and peer mappings
         // Clear through SecureIdentityStateManager instead of directly
         identityManager.clearAllIdentityData()
         peerIdentityStore.clearAll()
         locationPresenceStore.reset()
+        publicRateLimiter.reset()
 
         // Clear persistent favorites from keychain
         FavoritesPersistenceService.shared.clearAllFavorites()
+
+        // Drop courier mail carried for third parties (memory and disk),
+        // our own queued outbox, the carried public history, and the
+        // counters describing all of it
+        CourierStore.shared.wipe()
+        BridgeCourierService.shared.wipe()
+        messageRouter.wipeOutbox()
+        GossipMessageArchive.wipeDefault()
+        StoreAndForwardMetrics.shared.reset()
+
+        // Ambient-liveliness bookkeeping: sampled nearby-chat previews, the
+        // daily sightings tally, and the echoes-dismissed watermark
+        GeohashChatActivityTracker.shared.clear()
+        MeshSightingsTracker.shared.clear()
+        MeshEchoSettings.reset()
+
+        // Drop private group keys and rosters (keychain + disk)
+        groupStore.wipe()
+        // Drop cached peers' prekey bundles (who we could write to is
+        // metadata too). Our own prekey privates are keychain-backed and go
+        // with deleteAllKeychainData above plus the identity reset below.
+        PrekeyBundleStore.shared.wipe()
+        // Drop bulletin-board posts and tombstones (memory and disk); board
+        // posts are signed with our identity key and persist for days.
+        BoardStore.shared.wipe()
 
         // Identity manager has cleared persisted identity data above
 
@@ -1182,71 +1366,77 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         // Clear Nostr identity associations
         idBridge.clearAllAssociations()
 
-        // Disconnect from all peers and clear persistent identity
-        // This will force creation of a new identity (new fingerprint) on next launch
-        meshService.emergencyDisconnectAll()
+        // Replace the BLE identity while keeping the radio stopped. It may
+        // reopen only after the durable panic transaction commits.
         if let bleService = meshService as? BLEService {
-            bleService.resetIdentityForPanic(currentNickname: nickname)
+            bleService.resetIdentityForPanic(
+                currentNickname: nickname,
+                restartServices: false
+            )
+        } else {
+            meshService.setNickname(nickname)
         }
 
-        // No need to force UserDefaults synchronization
+        // The wipe must finish before this security action returns. A detached
+        // task could otherwise lose a race with a new capture or app exit and
+        // leave pre-panic media behind.
+        let panicCompleted: Bool
+        do {
+            try panicRecoveryOperations.wipeMedia(recoveryIntent)
+            if keychainWipeCompleted {
+                try panicRecoveryOperations.complete()
+                panicCompleted = true
+                SecureLogger.info(
+                    "🗑️ Deleted all media files during panic clear",
+                    category: .session
+                )
+            } else {
+                // Do not clear either durable recovery marker. Startup must
+                // retry the entire transaction before any transport restarts.
+                panicCompleted = false
+            }
+        } catch {
+            panicCompleted = false
+            SecureLogger.error(
+                "Panic transaction did not commit; services remain stopped: \(error)",
+                category: .security
+            )
+        }
+        panicRecoveryBlocked = !panicCompleted
 
-        // Reinitialize Nostr with new identity
-        // This will generate new Nostr keys derived from new Noise keys.
-        // Skipped under tests: connecting the shared relay singleton starts
-        // real network/reconnect work that never completes and would keep the
-        // test process alive (the singleton, unlike a discardable instance, is
-        // never deallocated to cancel it).
+        // BCH-01-013: Clear iOS app switcher snapshots. Keep tests away from
+        // the host user's real cache tree just as the default media wipe does.
+        #if os(iOS)
         if !TestEnvironment.isRunningTests {
-            Task { @MainActor in
-                // Small delay to ensure cleanup completes
-                try? await Task.sleep(nanoseconds: TransportConfig.uiAsyncShortSleepNs) // 0.1 seconds
+            Self.clearAppSwitcherSnapshots()
+        }
+        #endif
 
-                // Reinitialize Nostr relay manager with new identity. Reuse the
-                // shared singleton — every other component (NostrTransport, geohash
-                // subscriptions, AppRuntime observers) is bound to `.shared`, so
-                // creating a fresh instance here would split relay state and leave
-                // sends running against a disconnected manager.
+        guard panicCompleted else { return false }
+
+        if let bleService = meshService as? BLEService {
+            // Startup recovery reopens admission but leaves actual service
+            // start to the bootstrapper immediately after this method.
+            bleService.completePanicReset(
+                restartServices: restartServices
+            )
+        }
+
+        if restartServices {
+            // All persistent state and media are gone. Bring each service back
+            // only now, under the new identity.
+            if !(meshService is BLEService) {
+                meshService.startServices()
+            }
+
+            if !TestEnvironment.isRunningTests {
                 nostrRelayManager = NostrRelayManager.shared
                 setupNostrMessageHandling()
-                nostrRelayManager?.connect()
             }
+            panicNetworkLifecycle.restart()
         }
 
-        // Delete ALL media files (incoming and outgoing) in background
-        Task.detached(priority: .utility) {
-            do {
-                let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-                let filesDir = base.appendingPathComponent("files", isDirectory: true)
-
-                // Delete the entire files directory and recreate it
-                if FileManager.default.fileExists(atPath: filesDir.path) {
-                    try FileManager.default.removeItem(at: filesDir)
-                    SecureLogger.info("🗑️ Deleted all media files during panic clear", category: .session)
-                }
-
-                // Recreate empty directory structure
-                try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("voicenotes/incoming", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("voicenotes/outgoing", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("images/incoming", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("images/outgoing", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("files/incoming", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("files/outgoing", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-            } catch {
-                SecureLogger.error("Failed to clear media files during panic: \(error)", category: .session)
-            }
-
-            // BCH-01-013: Clear iOS app switcher snapshots
-            // These are stored in Library/Caches/Snapshots/<bundle_id>/
-            #if os(iOS)
-            Self.clearAppSwitcherSnapshots()
-            #endif
-        }
-
-        // Force immediate UI update for panic mode
-        // UI updates immediately - no flushing needed
-
+        return true
     }
 
     /// BCH-01-013: Clear iOS app switcher snapshots during panic mode
@@ -1427,6 +1617,14 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
 
     func setupNoiseCallbacks() {
         verificationCoordinator.setupNoiseCallbacks()
+        vouchCoordinator.setupNoiseCallbacks()
+    }
+
+    /// Whether the fingerprint currently counts as vouched (≥1 valid vouch
+    /// from a voucher I verified, and no explicit verification of mine).
+    @MainActor
+    func isVouchedFingerprint(_ fingerprint: String) -> Bool {
+        identityManager.isVouched(fingerprint: fingerprint)
     }
 
     // MARK: - BitchatDelegate Methods
@@ -1435,7 +1633,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
 
     /// Processes IRC-style commands starting with '/'.
     /// - Parameter command: The full command string including the leading slash
-    /// - Note: Supports commands like /nick, /msg, /who, /slap, /clear, /help
+    /// - Note: Supports commands like /msg, /who, /slap, /clear, /help
     @MainActor
     func handleCommand(_ command: String) {
         let result = commandProcessor.process(command)
@@ -1443,13 +1641,53 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         switch result {
         case .success(let message):
             if let msg = message {
-                addSystemMessage(msg)
+                addCommandOutput(msg)
             }
         case .error(let message):
-            addSystemMessage(message)
+            addCommandOutput(message)
         case .handled:
             // Command was handled, no message needed
             break
+        }
+    }
+
+    /// Command output belongs in the conversation where the user typed the
+    /// command; the public timeline is invisible while a DM is open. The DM
+    /// selection is read *after* processing so commands that switch chats
+    /// (`/msg`) print into the conversation they just opened.
+    @MainActor
+    private func addCommandOutput(_ content: String) {
+        if let peerID = selectedPrivateChatPeer {
+            addLocalPrivateSystemMessage(content, to: peerID)
+        } else {
+            addSystemMessage(content)
+        }
+    }
+
+    /// Origin conversation for deferred command output, captured when the
+    /// command is issued (before any async work starts).
+    @MainActor
+    func currentCommandDestination() -> CommandOutputDestination {
+        if let peerID = selectedPrivateChatPeer {
+            return .privateChat(peerID)
+        }
+        // Deferring commands (/ping) are rejected in geohash channels, so a
+        // non-DM origin is always the #mesh timeline.
+        return .meshTimeline
+    }
+
+    /// Routes deferred command output (async /ping results) into the
+    /// conversation captured at issue time, immune to chat switches in the
+    /// meantime. A DM result lands in the origin chat's history even if that
+    /// chat is no longer selected (or was cleared — it then reappears as the
+    /// first message when the chat is reopened).
+    @MainActor
+    func addCommandOutput(_ content: String, to destination: CommandOutputDestination) {
+        switch destination {
+        case .privateChat(let peerID):
+            addLocalPrivateSystemMessage(content, to: peerID)
+        case .meshTimeline:
+            publicConversationCoordinator.addMeshOnlySystemMessage(content)
         }
     }
 
@@ -1484,6 +1722,23 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         )
     }
 
+    func didReceiveGroupMessage(payload: Data, timestamp: Date) {
+        Task { @MainActor [weak self] in
+            self?.groupCoordinator.handleGroupMessagePayload(payload, timestamp: timestamp)
+        }
+    }
+
+    func didReceivePublicVoiceFrame(from peerID: PeerID, nickname: String, payload: Data, timestamp: Date) {
+        Task { @MainActor [weak self] in
+            self?.liveVoiceCoordinator.handlePublicVoiceFramePayload(
+                from: peerID,
+                nickname: nickname,
+                payload: payload,
+                timestamp: timestamp
+            )
+        }
+    }
+
     // MARK: - QR Verification API
     @MainActor
     func beginQRVerification(with qr: VerificationService.VerificationQR) -> Bool {
@@ -1511,6 +1766,12 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
 
     func didUpdatePeerList(_ peers: [PeerID]) {
         peerListCoordinator.didUpdatePeerList(peers)
+        // A peer-list update follows every verified announce, which is where a
+        // peer's `.vouch` capability actually arrives — retry vouching now that
+        // capabilities may finally be known (closes the auth-time capability race).
+        Task { @MainActor [weak self] in
+            self?.vouchCoordinator.peersUpdated(peers)
+        }
     }
 
     @MainActor
@@ -1599,6 +1860,19 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
     func addGeohashOnlySystemMessage(_ content: String) {
         publicConversationCoordinator.addGeohashOnlySystemMessage(content)
     }
+
+    /// Add a local system message to one specific geohash timeline, active or
+    /// not. Used by the board's new-pin alerts to scope-match the pin's channel.
+    @MainActor
+    func addGeohashSystemMessage(_ content: String, geohash: String) {
+        let systemMessage = BitchatMessage(
+            sender: "system",
+            content: content,
+            timestamp: Date(),
+            isRelay: false
+        )
+        appendGeohashMessageIfAbsent(systemMessage, toGeohash: geohash)
+    }
     // Send a public message without adding a local user echo.
     // Used for emotes where we want a local system-style confirmation instead.
     @MainActor
@@ -1606,10 +1880,36 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, TransportEventDele
         publicConversationCoordinator.sendPublicRaw(content)
     }
 
+    // Send a normal public message (with local echo) to the active channel.
+    // CommandContextProvider hook for commands that post real messages
+    // (`/pay`); only called when no private chat is selected.
+    @MainActor
+    func sendPublicMessage(_ content: String) {
+        sendMessage(content)
+    }
+
     /// Handle incoming public message
     @MainActor
     func handlePublicMessage(_ message: BitchatMessage) {
+        // Bridge hints are unauthenticated and may never suppress a genuine
+        // BLE sender. Once the radio packet has passed BLE signature checks,
+        // replace any earlier bridge alias before this row is enqueued.
+        if !message.isBridged,
+           let senderPeerID = message.senderPeerID,
+           !senderPeerID.isGeoChat {
+            BridgeService.shared.handleAuthenticatedRadioMessage(messageID: message.id)
+        }
+        // A finalized voice note whose burst already streamed in live swaps
+        // into the existing bubble instead of appearing twice.
+        if liveVoiceCoordinator.absorbFinalizedVoiceNote(message) { return }
         publicConversationCoordinator.handlePublicMessage(message)
+    }
+
+    /// Handle an incoming public Nostr message with its validated NIP-13
+    /// difficulty; sufficient PoW relaxes the per-sender rate limit.
+    @MainActor
+    func handlePublicMessage(_ message: BitchatMessage, powBits: Int) {
+        publicConversationCoordinator.handlePublicMessage(message, powBits: powBits)
     }
 
     /// Check for mentions and send notifications

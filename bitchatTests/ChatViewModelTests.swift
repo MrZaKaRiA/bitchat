@@ -15,8 +15,13 @@ import BitFoundation
 
 /// Creates a ChatViewModel with mock dependencies for testing
 @MainActor
-private func makeTestableViewModel() -> (viewModel: ChatViewModel, transport: MockTransport) {
-    let keychain = MockKeychain()
+private func makeTestableViewModel(
+    keychain injectedKeychain: MockKeychain? = nil,
+    panicMediaWipe: (() throws -> Void)? = nil,
+    panicRecoveryOperations: PanicRecoveryOperations? = nil,
+    panicNetworkLifecycle: PanicNetworkLifecycle = .noop
+) -> (viewModel: ChatViewModel, transport: MockTransport) {
+    let keychain = injectedKeychain ?? MockKeychain()
     let keychainHelper = MockKeychainHelper()
     let idBridge = NostrIdentityBridge(keychain: keychainHelper)
     let identityManager = MockIdentityManager(keychain)
@@ -26,7 +31,10 @@ private func makeTestableViewModel() -> (viewModel: ChatViewModel, transport: Mo
         keychain: keychain,
         idBridge: idBridge,
         identityManager: identityManager,
-        transport: transport
+        transport: transport,
+        panicMediaWipe: panicMediaWipe,
+        panicRecoveryOperations: panicRecoveryOperations,
+        panicNetworkLifecycle: panicNetworkLifecycle
     )
 
     return (viewModel, transport)
@@ -85,9 +93,14 @@ struct ChatViewModelInitializationTests {
             )
         ])
 
+        // The snapshot → allPeers binding hops the transport's unstructured
+        // Task, UnifiedPeerService, a receive(on: main), and another Task —
+        // all contending with every parallel worker, so a loaded CI runner
+        // can exceed defaultTimeout (observed: one 5s miss on a run where
+        // the whole suite took 10s instead of the usual ~4s).
         let updated = await TestHelpers.waitUntil({
             viewModel.allPeers.contains { $0.peerID == peerID && $0.nickname == "Alice" }
-        }, timeout: TestConstants.defaultTimeout)
+        }, timeout: TestConstants.longTimeout)
 
         #expect(updated)
     }
@@ -119,9 +132,10 @@ struct ChatViewModelIdentityTests {
             )
         ])
 
+        // Same multi-hop snapshot pipeline as above: longTimeout for load.
         let oldPeerBound = await TestHelpers.waitUntil({
             viewModel.connectedPeers.contains(oldPeerID)
-        }, timeout: TestConstants.defaultTimeout)
+        }, timeout: TestConstants.longTimeout)
         #expect(oldPeerBound)
 
         let existingMessage = BitchatMessage(
@@ -155,7 +169,7 @@ struct ChatViewModelIdentityTests {
 
         let newPeerBound = await TestHelpers.waitUntil({
             viewModel.connectedPeers.contains(newPeerID) && !viewModel.connectedPeers.contains(oldPeerID)
-        }, timeout: TestConstants.defaultTimeout)
+        }, timeout: TestConstants.longTimeout)
         #expect(newPeerBound)
 
         viewModel.updatePrivateChatPeerIfNeeded()
@@ -262,6 +276,59 @@ struct ChatViewModelCommandTests {
             #expect(transport.sentMessages.isEmpty)
             #expect(transport.sentPrivateMessages.isEmpty)
         }
+    }
+
+    @Test @MainActor
+    func handleCommand_outputRoutesToOpenPrivateChat() async {
+        let (viewModel, transport) = makeTestableViewModel()
+        let peerID = PeerID(str: "0000000000000002")
+        transport.simulateConnect(peerID, nickname: "Alice")
+        viewModel.selectedPrivateChatPeer = peerID
+
+        viewModel.handleCommand("/help")
+
+        #expect(viewModel.privateChats[peerID]?.last?.content == CommandProcessor.helpText)
+        #expect(!viewModel.messages.contains { $0.content == CommandProcessor.helpText })
+    }
+
+    @Test @MainActor
+    func handleCommand_errorRoutesToOpenPrivateChat() async {
+        let (viewModel, transport) = makeTestableViewModel()
+        let peerID = PeerID(str: "0000000000000002")
+        transport.simulateConnect(peerID, nickname: "Alice")
+        viewModel.selectedPrivateChatPeer = peerID
+
+        viewModel.handleCommand("/bogus")
+
+        let dmContents = viewModel.privateChats[peerID]?.map(\.content) ?? []
+        #expect(dmContents.contains { $0.hasPrefix("unknown command: /bogus") })
+        #expect(!viewModel.messages.contains { $0.content.hasPrefix("unknown command: /bogus") })
+    }
+
+    @Test @MainActor
+    func handleCommand_outputRoutesToPublicTimelineWithoutOpenDM() async {
+        let (viewModel, _) = makeTestableViewModel()
+
+        viewModel.handleCommand("/bogus")
+
+        #expect(viewModel.messages.last?.content.hasPrefix("unknown command: /bogus") == true)
+    }
+
+    @Test @MainActor
+    func handleCommand_msgSuccessLandsInNewlyOpenedChat() async {
+        let (viewModel, transport) = makeTestableViewModel()
+        let peerID = PeerID(str: "0000000000000002")
+        transport.simulateConnect(peerID, nickname: "Alice")
+        let resolved = await TestHelpers.waitUntil({
+            viewModel.getPeerIDForNickname("Alice") == peerID
+        }, timeout: TestConstants.defaultTimeout)
+        #expect(resolved)
+
+        viewModel.handleCommand("/msg Alice")
+
+        #expect(viewModel.selectedPrivateChatPeer == peerID)
+        #expect(viewModel.privateChats[peerID]?.last?.content == "started private chat with Alice")
+        #expect(!viewModel.messages.contains { $0.content == "started private chat with Alice" })
     }
 }
 
@@ -588,6 +655,25 @@ struct ChatViewModelFormattingTests {
     }
 
     @Test @MainActor
+    func formatMessageAsText_longCashuFallsBackToPlain() async {
+        let (viewModel, _) = makeTestableViewModel()
+        let cashu = "cashuA" + String(repeating: "a", count: 40)
+        let longContent = "hi @bob " + cashu + " " + String(repeating: "x", count: 4_100)
+        let message = BitchatMessage(
+            id: "fmt-long-cashu",
+            sender: "Alice#a1b2",
+            content: longContent,
+            timestamp: Date(timeIntervalSince1970: 1_700_010_123),
+            isRelay: false,
+            senderPeerID: PeerID(str: "00000000000000b3")
+        )
+
+        let formatted = viewModel.formatMessageAsText(message, colorScheme: .light)
+
+        #expect(String(formatted.characters) == "<@Alice#a1b2> \(longContent) [\(message.formattedTimestamp)]")
+    }
+
+    @Test @MainActor
     func formatMessageHeader_formatsSenderHeader() async {
         let (viewModel, _) = makeTestableViewModel()
         let message = BitchatMessage(
@@ -700,6 +786,40 @@ struct ChatViewModelRateLimitingTests {
 // MARK: - Public Conversation Tests
 
 struct ChatViewModelPublicConversationTests {
+
+    @Test @MainActor
+    func bridgeAliasReplacementDoesNotContentDedupAwayAuthenticatedRadioRow() {
+        let (viewModel, _) = makeTestableViewModel()
+        let content = "same bridge and radio payload"
+        let timestamp = Date()
+        let bridgeMessage = BitchatMessage(
+            id: "bridge-event-id",
+            sender: "remote#beef",
+            content: content,
+            timestamp: timestamp,
+            isRelay: false,
+            senderPeerID: PeerID(bridge: String(repeating: "a", count: 64)),
+            isBridged: true
+        )
+        viewModel.handlePublicMessage(bridgeMessage)
+        viewModel.publicMessagePipeline.flushIfNeeded()
+        #expect(viewModel.publicConversationContainsMessage(withID: bridgeMessage.id, in: .mesh))
+
+        viewModel.removeBridgeInjectedPublicMessage(withID: bridgeMessage.id)
+        let radioMessage = BitchatMessage(
+            id: "radio-stable-id",
+            sender: "remote",
+            content: content,
+            timestamp: timestamp,
+            isRelay: false,
+            senderPeerID: PeerID(str: "1122334455667788")
+        )
+        viewModel.handlePublicMessage(radioMessage)
+        viewModel.publicMessagePipeline.flushIfNeeded()
+
+        #expect(!viewModel.publicConversationContainsMessage(withID: bridgeMessage.id, in: .mesh))
+        #expect(viewModel.publicConversationContainsMessage(withID: radioMessage.id, in: .mesh))
+    }
 
     @Test @MainActor
     func addPublicSystemMessage_persistsAcrossTimelineRefresh() async {
@@ -1003,6 +1123,159 @@ struct ChatViewModelBluetoothTests {
 // MARK: - Panic Clear Tests
 
 struct ChatViewModelPanicTests {
+
+    @Test @MainActor
+    func panicClearAllData_finishesMediaWipeBeforeReturning() {
+        var wipeFinished = false
+        let (viewModel, _) = makeTestableViewModel(panicMediaWipe: {
+            wipeFinished = true
+        })
+
+        viewModel.panicClearAllData()
+
+        #expect(wipeFinished)
+    }
+
+    @Test @MainActor
+    func panicClearAllData_stopsNetworkBeforeWipeAndRestartsAfterCommit() {
+        var events: [String] = []
+        let lifecycle = PanicNetworkLifecycle(
+            stop: { events.append("stop") },
+            restart: { events.append("restart") }
+        )
+        let (viewModel, _) = makeTestableViewModel(
+            panicMediaWipe: { events.append("wipe") },
+            panicNetworkLifecycle: lifecycle
+        )
+
+        let completed = viewModel.panicClearAllData()
+
+        #expect(completed)
+        #expect(events == ["stop", "wipe", "restart"])
+        #expect(viewModel.networkActivationAllowed)
+    }
+
+    @Test @MainActor
+    func panicKeychainFailureKeepsRecoveryPendingAndServicesStopped() {
+        let keychain = MockKeychain()
+        keychain.simulatedDeleteAllResult = false
+        var events: [String] = []
+        let operations = PanicRecoveryOperations(
+            isPending: { false },
+            begin: {
+                events.append("begin")
+                return PanicRecoveryIntent(
+                    fileMarkerEstablished: true,
+                    externalMarkerEstablished: false
+                )
+            },
+            wipeMedia: { _ in events.append("wipe") },
+            complete: { events.append("complete") }
+        )
+        let lifecycle = PanicNetworkLifecycle(
+            stop: { events.append("stop") },
+            restart: { events.append("restart") }
+        )
+        let (viewModel, transport) = makeTestableViewModel(
+            keychain: keychain,
+            panicRecoveryOperations: operations,
+            panicNetworkLifecycle: lifecycle
+        )
+        let startsBeforePanic = transport.startServicesCallCount
+
+        let completed = viewModel.panicClearAllData()
+
+        #expect(!completed)
+        #expect(events == ["stop", "begin", "wipe"])
+        #expect(keychain.deleteAllCallCount == 1)
+        #expect(transport.startServicesCallCount == startsBeforePanic)
+        #expect(!viewModel.networkActivationAllowed)
+    }
+
+    @Test @MainActor
+    func pendingPanicRecoveryCompletesBeforeTransportBootstrap() {
+        var events: [String] = []
+        let operations = PanicRecoveryOperations(
+            isPending: {
+                events.append("read")
+                return true
+            },
+            begin: {
+                events.append("begin")
+                return PanicRecoveryIntent(
+                    fileMarkerEstablished: true,
+                    externalMarkerEstablished: false
+                )
+            },
+            wipeMedia: { _ in events.append("wipe") },
+            complete: { events.append("complete") }
+        )
+
+        let (viewModel, transport) = makeTestableViewModel(
+            panicRecoveryOperations: operations
+        )
+
+        #expect(events == ["read", "begin", "wipe", "complete"])
+        #expect(transport.emergencyDisconnectCallCount == 1)
+        #expect(transport.startServicesCallCount == 1)
+        #expect(viewModel.networkActivationAllowed)
+    }
+
+    @Test @MainActor
+    func failedStartupRecoveryLeavesTransportAndNetworkBlocked() {
+        enum WipeFailure: Error { case failed }
+        var completedMarker = false
+        let operations = PanicRecoveryOperations(
+            isPending: { true },
+            begin: {
+                PanicRecoveryIntent(
+                    fileMarkerEstablished: true,
+                    externalMarkerEstablished: false
+                )
+            },
+            wipeMedia: { _ in throw WipeFailure.failed },
+            complete: { completedMarker = true }
+        )
+
+        let (viewModel, transport) = makeTestableViewModel(
+            panicRecoveryOperations: operations
+        )
+
+        #expect(!completedMarker)
+        #expect(transport.emergencyDisconnectCallCount == 1)
+        #expect(transport.startServicesCallCount == 0)
+        #expect(!viewModel.networkActivationAllowed)
+    }
+
+    @Test @MainActor
+    func failedStartupKeychainRecoveryLeavesIntentAndTransportBlocked() {
+        let keychain = MockKeychain()
+        keychain.simulatedDeleteAllResult = false
+        var events: [String] = []
+        let operations = PanicRecoveryOperations(
+            isPending: { true },
+            begin: {
+                events.append("begin")
+                return PanicRecoveryIntent(
+                    fileMarkerEstablished: true,
+                    externalMarkerEstablished: true
+                )
+            },
+            wipeMedia: { _ in events.append("wipe") },
+            complete: { events.append("complete") }
+        )
+
+        let (viewModel, transport) = makeTestableViewModel(
+            keychain: keychain,
+            panicRecoveryOperations: operations
+        )
+
+        #expect(events == ["begin", "wipe"])
+        #expect(keychain.deleteAllCallCount == 1)
+        #expect(transport.emergencyDisconnectCallCount == 1)
+        #expect(transport.startServicesCallCount == 0)
+        #expect(!viewModel.networkActivationAllowed)
+    }
 
     @Test @MainActor
     func panicClearAllData_delegatesToTransport() async {

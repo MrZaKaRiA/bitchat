@@ -14,18 +14,15 @@ enum NoiseSecurityConstants {
     
     // Maximum handshake message size
     static let maxHandshakeMessageSize = 2048 // 2KB to accommodate XX pattern
+
+    // Noise XX message 1 contains only the initiator's 32-byte ephemeral key.
+    static let xxInitialMessageSize = 32
     
     // Session timeout - sessions older than this should be renegotiated
     static let sessionTimeout: TimeInterval = 86400 // 24 hours
     
     // Maximum number of messages before rekey (2^64 - 1 is the nonce limit)
     static let maxMessagesPerSession: UInt64 = 1_000_000_000 // 1 billion messages
-    
-    // Handshake timeout - abandon incomplete handshakes
-    static let handshakeTimeout: TimeInterval = 60 // 1 minute
-    
-    // Maximum concurrent sessions per peer
-    static let maxSessionsPerPeer = 3
     
     // Rate limiting
     static let maxHandshakesPerMinute = 10

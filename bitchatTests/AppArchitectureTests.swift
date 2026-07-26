@@ -147,6 +147,44 @@ struct AppArchitectureTests {
         #expect(store.teleportedGeo.isEmpty)
     }
 
+    @Test("LocationPresenceStore bounds and prunes teleported geohash participants")
+    @MainActor
+    func locationPresenceStoreBoundsTeleportedParticipants() {
+        let store = LocationPresenceStore(teleportedGeoCapacity: 2)
+
+        store.setCurrentGeohash("u4pruy")
+        store.markTeleported("AAAAAA")
+        store.markTeleported("BBBBBB")
+        store.markTeleported("CCCCCC")
+
+        #expect(store.teleportedGeo == Set(["bbbbbb", "cccccc"]))
+
+        store.retainTeleportedGeo(keeping: Set(["CCCCCC"]))
+        #expect(store.teleportedGeo == Set(["cccccc"]))
+
+        store.setCurrentGeohash("u4pruz")
+        #expect(store.teleportedGeo.isEmpty)
+    }
+
+    @Test("LocationPresenceStore bounds geohash nicknames and clears on channel switch")
+    @MainActor
+    func locationPresenceStoreBoundsGeoNicknames() {
+        let store = LocationPresenceStore(geoNicknameCapacity: 2)
+
+        store.setCurrentGeohash("u4pruy")
+        store.setNickname("alice", for: "AAAAAA")
+        store.setNickname("bob", for: "BBBBBB")
+        store.setNickname("carol", for: "CCCCCC")
+
+        #expect(store.geoNicknames == ["bbbbbb": "bob", "cccccc": "carol"])
+
+        store.retainGeoNicknames(keeping: Set(["CCCCCC"]))
+        #expect(store.geoNicknames == ["cccccc": "carol"])
+
+        store.setCurrentGeohash("u4pruz")
+        #expect(store.geoNicknames.isEmpty)
+    }
+
     @Test("PeerHandle equality and hashing use the canonical identity only")
     func peerHandleEqualityUsesCanonicalIdentity() {
         let first = PeerHandle(id: "noise:abc123", routingPeerID: PeerID(str: "peer-a"))
@@ -589,6 +627,45 @@ struct AppArchitectureTests {
             !verificationModel.isVerified(peerID: peerID)
         }
         #expect(!verificationModel.isVerified(peerID: peerID))
+    }
+
+    @Test("VerificationModel refreshes when peer trust changes (vouch accepted)")
+    @MainActor
+    func verificationModelRefreshesOnPeerTrustChange() async {
+        let viewModel = makeArchitectureViewModel()
+        var privateConversationModel: PrivateConversationModel? = PrivateConversationModel(
+            chatViewModel: viewModel,
+            conversations: viewModel.conversations,
+            locationChannelsModel: LocationChannelsModel(manager: makeArchitectureLocationManager())
+        )
+        let verificationModel = VerificationModel(
+            chatViewModel: viewModel,
+            privateConversationModel: privateConversationModel!
+        )
+
+        // PrivateConversationModel happens to observe the same notification
+        // and re-assign its published selection, which would ripple into
+        // VerificationModel; release it so this test pins VerificationModel's
+        // own subscription rather than that incidental chain.
+        privateConversationModel = nil
+
+        // The bound @Published sources replay their current values on
+        // subscription; let those initial main-queue emissions settle so the
+        // sink below observes only the trust-change signal.
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        // ChatVouchCoordinator.notifyPeerTrustChanged() signals accepted
+        // vouches via "peerStatusUpdated"; an open fingerprint sheet must
+        // re-render its vouched badge from that signal alone.
+        var refreshed = false
+        let cancellable = verificationModel.objectWillChange.sink { _ in
+            refreshed = true
+        }
+        defer { cancellable.cancel() }
+
+        NotificationCenter.default.post(name: Notification.Name("peerStatusUpdated"), object: nil)
+        await waitUntil { refreshed }
+        #expect(refreshed)
     }
 
     @Test("PeerListModel publishes mesh and geohash directory state")
