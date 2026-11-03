@@ -30,16 +30,22 @@ final class LocationPresenceStore: ObservableObject {
         currentGeohash = normalized
     }
 
-    func setNickname(_ nickname: String, for pubkeyHex: String) {
+    /// Returns whether the stored nickname changed. Chat events repeat the
+    /// sender's nickname every time; rewriting an unchanged value would
+    /// republish the whole table.
+    @discardableResult
+    func setNickname(_ nickname: String, for pubkeyHex: String) -> Bool {
         guard geoNicknameCapacity > 0 else {
             clearGeoNicknames()
-            return
+            return false
         }
 
+        let nickname = nickname.normalizedNickname
         let key = pubkeyHex.lowercased()
-        if geoNicknames[key] != nil {
+        if let existing = geoNicknames[key] {
+            guard existing != nickname else { return false }
             geoNicknames[key] = nickname
-            return
+            return true
         }
 
         while geoNicknameOrder.count >= geoNicknameCapacity, let oldest = geoNicknameOrder.first {
@@ -49,6 +55,7 @@ final class LocationPresenceStore: ObservableObject {
 
         geoNicknames[key] = nickname
         geoNicknameOrder.append(key)
+        return true
     }
 
     func replaceGeoNicknames(_ nicknames: [String: String]) {
@@ -64,7 +71,7 @@ final class LocationPresenceStore: ObservableObject {
             let lower = key.lowercased()
             guard seen.insert(lower).inserted else { continue }
             ordered.append(lower)
-            normalized[lower] = value
+            normalized[lower] = value.normalizedNickname
         }
         if ordered.count > geoNicknameCapacity {
             let kept = Array(ordered.suffix(geoNicknameCapacity))
@@ -80,12 +87,6 @@ final class LocationPresenceStore: ObservableObject {
     func clearGeoNicknames() {
         geoNicknames.removeAll()
         geoNicknameOrder.removeAll()
-    }
-
-    func retainGeoNicknames(keeping pubkeys: Set<String>) {
-        let allowed = Set(pubkeys.map { $0.lowercased() })
-        geoNicknameOrder = geoNicknameOrder.filter { allowed.contains($0) }
-        geoNicknames = geoNicknames.filter { allowed.contains($0.key) }
     }
 
     func markTeleported(_ pubkeyHex: String) {
@@ -108,6 +109,7 @@ final class LocationPresenceStore: ObservableObject {
 
     func clearTeleported(_ pubkeyHex: String) {
         let key = pubkeyHex.lowercased()
+        guard teleportedGeo.contains(key) else { return }
         teleportedGeo.remove(key)
         teleportedGeoOrder.removeAll { $0 == key }
     }
@@ -131,8 +133,11 @@ final class LocationPresenceStore: ObservableObject {
         teleportedGeo = Set(ordered)
     }
 
+    /// Prunes only when someone actually left: every assignment republishes
+    /// `teleportedGeo`, and its subscribers rebuild the people list.
     func retainTeleportedGeo(keeping pubkeys: Set<String>) {
         let allowed = Set(pubkeys.map { $0.lowercased() })
+        guard !teleportedGeo.isSubset(of: allowed) else { return }
         teleportedGeoOrder = teleportedGeoOrder.filter { allowed.contains($0) }
         teleportedGeo = teleportedGeo.intersection(allowed)
     }

@@ -27,6 +27,7 @@ final class AppRuntime: ObservableObject {
     let peerListModel: PeerListModel
     let appChromeModel: AppChromeModel
     let boardAlertsModel: BoardAlertsModel
+    let sharedContentImportModel: SharedContentImportModel
 
     private let idBridge: NostrIdentityBridge
     private var cancellables = Set<AnyCancellable>()
@@ -41,7 +42,8 @@ final class AppRuntime: ObservableObject {
 
     init(
         keychain: KeychainManagerProtocol = KeychainManager.makeDefault(),
-        idBridge: NostrIdentityBridge = NostrIdentityBridge()
+        idBridge: NostrIdentityBridge = NostrIdentityBridge(),
+        sharedContentStore: SharedContentStore? = nil
     ) {
         self.idBridge = idBridge
         let conversations = ConversationStore()
@@ -84,9 +86,20 @@ final class AppRuntime: ObservableObject {
             peerIdentityStore: peerIdentityStore,
             locationPresenceStore: locationPresenceStore
         )
+        let resolvedSharedContentStore: SharedContentStore?
+        if let sharedContentStore {
+            resolvedSharedContentStore = sharedContentStore
+        } else if let sharedDefaults = UserDefaults(suiteName: BitchatApp.groupID) {
+            resolvedSharedContentStore = SharedContentStore(defaults: sharedDefaults)
+        } else {
+            resolvedSharedContentStore = nil
+        }
+        let sharedContentImportModel = SharedContentImportModel(store: resolvedSharedContentStore)
+        self.sharedContentImportModel = sharedContentImportModel
         self.appChromeModel = AppChromeModel(
             chatViewModel: self.chatViewModel,
-            privateInboxModel: self.privateInboxModel
+            privateInboxModel: self.privateInboxModel,
+            onPanicWipe: { sharedContentImportModel.discardAll() }
         )
         let chatViewModel = self.chatViewModel
         self.boardAlertsModel = BoardAlertsModel(
@@ -106,7 +119,6 @@ final class AppRuntime: ObservableObject {
                 }
             )
         )
-
         if chatViewModel.networkActivationAllowed {
             GeoRelayDirectory.shared.prefetchIfNeeded()
         }
@@ -140,9 +152,24 @@ final class AppRuntime: ObservableObject {
         NetworkActivationService.shared.start()
         GeohashPresenceService.shared.start()
         checkForSharedContent()
+        performMediaMaintenance()
 
         record(.launched)
         record(.startupCompleted)
+    }
+
+    /// Drops media that has outlived the retention window, then applies the
+    /// explicit protection class to files that older builds wrote without
+    /// one. Expiry runs first so the migration never touches files the
+    /// sweep is about to delete. Detached because `AppRuntime` is
+    /// main-actor and both passes go file by file through the media tree;
+    /// best-effort, nothing at launch depends on their results.
+    private func performMediaMaintenance() {
+        Task.detached(priority: .utility) {
+            let store = BLEIncomingFileStore()
+            store.expireAgedMedia()
+            store.migrateFileProtectionIfNeeded()
+        }
     }
 
     func handleOpenURL(_ url: URL) {
@@ -307,6 +334,16 @@ private extension AppRuntime {
             }
             .store(in: &cancellables)
 
+        NotificationCenter.default.publisher(for: .TorBootstrapDidStall)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard self?.chatViewModel.networkActivationAllowed == true
+                else { return }
+                self?.record(.torLifecycleChanged(.bootstrapDidStall))
+                self?.chatViewModel.handleTorBootstrapDidStall()
+            }
+            .store(in: &cancellables)
+
         NotificationCenter.default.publisher(for: .TorUserPreferenceChanged)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
@@ -328,45 +365,22 @@ private extension AppRuntime {
     }
 
     func checkForSharedContent() {
-        guard chatViewModel.networkActivationAllowed else { return }
-        guard let userDefaults = UserDefaults(suiteName: BitchatApp.groupID) else { return }
-        let clearSharedContent = {
-            userDefaults.removeObject(forKey: "sharedContent")
-            userDefaults.removeObject(forKey: "sharedContentType")
-            userDefaults.removeObject(forKey: "sharedContentDate")
+        let previousID = sharedContentImportModel.offer?.id
+        guard let payload = sharedContentImportModel.refresh(
+            destination: currentSharedContentDestination
+        ) else { return }
+
+        if previousID != payload.id {
+            record(.sharedContentReadyForReview(payload.kind))
         }
+    }
 
-        guard let sharedContent = userDefaults.string(forKey: "sharedContent"),
-              let sharedDate = userDefaults.object(forKey: "sharedContentDate") as? Date else {
-            // A partial or malformed handoff must not linger in the shared
-            // app-group container indefinitely.
-            clearSharedContent()
-            return
-        }
-
-        guard Date().timeIntervalSince(sharedDate) < TransportConfig.uiShareAcceptWindowSeconds else {
-            clearSharedContent()
-            return
-        }
-
-        let contentKind = SharedContentKind(rawValue: userDefaults.string(forKey: "sharedContentType") ?? "") ?? .text
-
-        clearSharedContent()
-
-        switch contentKind {
-        case .url:
-            if let data = sharedContent.data(using: .utf8),
-               let urlData = try? JSONSerialization.jsonObject(with: data) as? [String: String],
-               let url = urlData["url"] {
-                chatViewModel.sendMessage(url)
-            } else {
-                chatViewModel.sendMessage(sharedContent)
-            }
-        case .text:
-            chatViewModel.sendMessage(sharedContent)
-        }
-
-        record(.sharedContentAccepted(contentKind))
+    var currentSharedContentDestination: SharedContentDestination {
+        SharedContentDestination.resolve(
+            selectedPrivatePeerID: privateConversationModel.selectedPeerID,
+            privateDisplayName: privateConversationModel.selectedHeaderState?.displayName,
+            activeChannel: locationChannelsModel.selectedChannel
+        )
     }
 
     func handleNostrRelayConnectionChanged(_ isConnected: Bool) {
@@ -410,16 +424,24 @@ private extension AppRuntime {
     }
 
     func handleScreenshotCaptured() {
-        if appChromeModel.isLocationChannelsSheetPresented {
+        let isLocationChannelActive: Bool = {
+            if case .location = chatViewModel.activeChannel { return true }
+            return false
+        }()
+
+        switch Self.resolveScreenshotResponse(
+            isLocationChannelsSheetPresented: appChromeModel.isLocationChannelsSheetPresented,
+            isAppInfoPresented: appChromeModel.isAppInfoPresented,
+            hasPrivateChatOpen: chatViewModel.selectedPrivateChatPeer != nil,
+            isLocationChannelActive: isLocationChannelActive
+        ) {
+        case .warnLocally:
             appChromeModel.triggerScreenshotPrivacyWarning()
-            return
+        case .ignore:
+            break
+        case .forwardToChat:
+            chatViewModel.handleScreenshotCaptured()
         }
-
-        if appChromeModel.isAppInfoPresented {
-            return
-        }
-
-        chatViewModel.handleScreenshotCaptured()
     }
 
     func openExternalURL(_ url: URL) {
@@ -434,5 +456,42 @@ private extension AppRuntime {
         Task {
             await events.emit(event)
         }
+    }
+}
+
+// MARK: - Screenshot routing
+
+extension AppRuntime {
+    /// What a screenshot triggers. Nothing on this table sends anything to
+    /// a public channel (see `ChatLifecycleCoordinator.handleScreenshotCaptured`).
+    enum ScreenshotCaptureResponse: Equatable {
+        /// Show the local location-privacy alert; nothing is sent anywhere.
+        case warnLocally
+        /// Do nothing. App Info holds no conversation or location content.
+        case ignore
+        /// Hand to the chat layer: a DM notice goes to the peer when a
+        /// secure session exists; public timelines stay silent. Mesh
+        /// deliberately gets no local alert either — a mesh screenshot
+        /// reveals no place and triggers no send, so there is nothing to
+        /// warn about, and alerting on every screenshot would train people
+        /// to dismiss the one alert that matters (the location one).
+        case forwardToChat
+    }
+
+    /// Pure decision table so the screenshot routing is testable without a
+    /// runtime.
+    nonisolated static func resolveScreenshotResponse(
+        isLocationChannelsSheetPresented: Bool,
+        isAppInfoPresented: Bool,
+        hasPrivateChatOpen: Bool,
+        isLocationChannelActive: Bool
+    ) -> ScreenshotCaptureResponse {
+        if isLocationChannelsSheetPresented { return .warnLocally }
+        if isAppInfoPresented { return .ignore }
+        // A geohash timeline screenshot still reveals a place — warn the
+        // person taking it, locally, with the same alert the channel sheet
+        // uses.
+        if !hasPrivateChatOpen, isLocationChannelActive { return .warnLocally }
+        return .forwardToChat
     }
 }

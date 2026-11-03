@@ -230,8 +230,7 @@ final class Conversation: ObservableObject, Identifiable {
 
     // MARK: Internals
 
-    static func shouldSkipStatusUpdate(current: DeliveryStatus?, new: DeliveryStatus) -> Bool {
-        guard let current else { return false }
+    static func shouldSkipStatusUpdate(current: DeliveryStatus, new: DeliveryStatus) -> Bool {
         if current == new { return true }
 
         // Never downgrade to a weaker delivery state. Ordering of certainty:
@@ -253,6 +252,10 @@ final class Conversation: ObservableObject, Identifiable {
         case (.carried, .sent), (.carried, .sending):
             return true
         case (.sent, .sending):
+            return true
+        case (_, .notSentYet):
+            // .notSentYet is the pre-transport initial state; once a message
+            // has any real status, resetting to it is always a downgrade.
             return true
         default:
             return false
@@ -442,6 +445,40 @@ final class ConversationStore: ObservableObject {
     @discardableResult
     func setDeliveryStatus(_ status: DeliveryStatus, forMessageID messageID: String) -> Bool {
         guard let ids = conversationIDsByMessageID[messageID] else { return false }
+        return applyDeliveryStatus(status, forMessageID: messageID, among: ids)
+    }
+
+    /// Applies an authenticated delivery/read receipt only to the supplied
+    /// direct-conversation aliases. A colliding message ID in another peer's
+    /// conversation (or a public timeline) must not inherit the receipt.
+    ///
+    /// Stable and ephemeral aliases can temporarily hold the same message
+    /// instance during handoff. The shared helper republishes every targeted
+    /// alias even when the first mutation already changed that instance.
+    @discardableResult
+    func setDeliveryStatus(
+        _ status: DeliveryStatus,
+        forMessageID messageID: String,
+        inDirectPeerAliases peerIDs: Set<PeerID>
+    ) -> Bool {
+        guard !peerIDs.isEmpty,
+              let indexedIDs = conversationIDsByMessageID[messageID] else {
+            return false
+        }
+        let allowedIDs = Set(peerIDs.map { ConversationID.directPeer($0) })
+        return applyDeliveryStatus(
+            status,
+            forMessageID: messageID,
+            among: indexedIDs.intersection(allowedIDs)
+        )
+    }
+
+    private func applyDeliveryStatus(
+        _ status: DeliveryStatus,
+        forMessageID messageID: String,
+        among ids: Set<ConversationID>
+    ) -> Bool {
+        guard !ids.isEmpty else { return false }
         var applied = false
         var skipped: [ConversationID] = []
         for id in ids {
